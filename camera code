@@ -1,0 +1,789 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+from collections import deque
+
+CAMERA_ID = 0
+CAM_W = 1280
+CAM_H = 720
+
+GLASS_W = 340
+GLASS_H = 240
+BORDER = 16
+CORNER_RADIUS = 28
+
+ZOOM = 1.85
+CHROMA = 0.0035
+REFRACT = 0.06
+
+TINT_BGR = (170, 195, 215)
+TINT_ALPHA = 0.10
+
+GLARE_ALPHA = 0.35
+SPECULAR_ALPHA = 0.18
+
+SHADOW_ALPHA = 0.28
+SHADOW_OFFSET = 10
+SHADOW_BLUR = 15
+
+FRICTION = 0.90
+ANG_FRICTION = 0.92
+BOUNCE = 0.55
+FLICK_MULT = 1.4
+MAX_SPEED = 45.0
+MAX_ANG_SPEED = 8.0
+
+SMOOTH_POS = 0.35
+SMOOTH_ANGLE = 0.30
+SMOOTH_SIZE = 0.28
+SMOOTH_TILT = 0.20
+
+RELEASE_GRACE = 8
+GESTURE_HOLD = 3
+
+PINCH_PRESS = 42
+PINCH_RELEASE = 62
+
+SHOW_SHADOW = True
+SHOW_GLARE = True
+SHOW_DEBUG = False
+
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.7
+)
+
+cap = cv2.VideoCapture(CAMERA_ID)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+cap.set(cv2.CAP_PROP_FPS, 60)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+if not cap.isOpened():
+    print("Камера не найдена")
+    exit()
+
+WINDOW_NAME = "Glass Item"
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+FULLSCREEN = True
+
+def rot_mat(deg):
+    a = np.deg2rad(deg)
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s], [s, c]], dtype=np.float32)
+
+def point_in_glass(px, py, cx, cy, w, h, angle):
+    R = rot_mat(-angle)
+    v = np.array([px - cx, py - cy], dtype=np.float32)
+    lv = R @ v
+    return abs(lv[0]) <= w / 2 and abs(lv[1]) <= h / 2
+
+def rounded_rect_poly(cx, cy, w, h, angle, r, steps=6):
+    hw, hh = w / 2, h / 2
+    r = min(r, hw * 0.9, hh * 0.9)
+    pts = []
+    corners = [
+        (hw - r, -hh + r, -90, 0),
+        (hw - r,  hh - r, 0, 90),
+        (-hw + r, hh - r, 90, 180),
+        (-hw + r, -hh + r, 180, 270)
+    ]
+    for ccx, ccy, a0, a1 in corners:
+        for t in np.linspace(a0, a1, steps):
+            a = np.deg2rad(t)
+            pts.append([ccx + r * np.cos(a), ccy + r * np.sin(a)])
+    pts = np.array(pts, dtype=np.float32)
+    R = rot_mat(angle)
+    return (pts @ R.T) + np.array([cx, cy], dtype=np.float32)
+
+def ang_diff(a, b):
+    d = a - b
+    while d > 180: d -= 360
+    while d < -180: d += 360
+    return d
+
+FINGER_TIPS = [
+    mp_hands.HandLandmark.THUMB_TIP,
+    mp_hands.HandLandmark.INDEX_FINGER_TIP,
+    mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
+    mp_hands.HandLandmark.RING_FINGER_TIP,
+    mp_hands.HandLandmark.PINKY_TIP,
+]
+FINGER_PIPS = [
+    mp_hands.HandLandmark.THUMB_IP,
+    mp_hands.HandLandmark.INDEX_FINGER_PIP,
+    mp_hands.HandLandmark.MIDDLE_FINGER_PIP,
+    mp_hands.HandLandmark.RING_FINGER_PIP,
+    mp_hands.HandLandmark.PINKY_PIP,
+]
+
+def count_extended_fingers(hand, fw, fh):
+    wrist = hand.landmark[mp_hands.HandLandmark.WRIST]
+    wx, wy = wrist.x * fw, wrist.y * fh
+    mmcp = hand.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_MCP]
+    palm_size = max(np.hypot(mmcp.x * fw - wx, mmcp.y * fh - wy), 1.0)
+
+    ext = []
+    for tip_id, pip_id in zip(FINGER_TIPS, FINGER_PIPS):
+        t = hand.landmark[tip_id]
+        p = hand.landmark[pip_id]
+        d_tip = np.hypot(t.x * fw - wx, t.y * fh - wy)
+        d_pip = np.hypot(p.x * fw - wx, p.y * fh - wy)
+        ext.append(1 if d_tip > d_pip * 1.05 else 0)
+
+    thumb = hand.landmark[mp_hands.HandLandmark.THUMB_TIP]
+    index_mcp = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_MCP]
+    d_thumb = np.hypot(thumb.x * fw - index_mcp.x * fw,
+                       thumb.y * fh - index_mcp.y * fh)
+    ext[0] = 1 if d_thumb > palm_size * 0.6 else 0
+
+    return int(sum(ext)), ext
+
+class GlassItem:
+    def __init__(self, cx, cy, w, h, angle=0.0):
+        self.cx, self.cy = float(cx), float(cy)
+        self.w, self.h = float(w), float(h)
+        self.angle = float(angle)
+
+        self.target_cx, self.target_cy = self.cx, self.cy
+        self.target_w, self.target_h = self.w, self.h
+        self.target_angle = self.angle
+
+        self.vx, self.vy = 0.0, 0.0
+        self.va = 0.0
+
+        self.grabbed = False
+        self.grab_anchor_local = np.zeros(2, dtype=np.float32)
+        self.grab_start_w = self.w
+        self.grab_start_h = self.h
+        self.grab_start_angle = self.angle
+        self.grab_start_dist = 1.0
+        self.grab_start_hand_angle = 0.0
+        self.grab_center_offset = np.zeros(2, dtype=np.float32)
+
+        self.breath_phase = 0.0
+        self.tilt = 0.0
+        self.tilt_smooth = 0.0
+        self.glow = 0.0
+
+        self.fingers_used = 0
+        self.gesture_name = "—"
+
+    def current_w(self):
+        return self.w * (1 + 0.003 * np.sin(self.breath_phase))
+
+    def current_h(self):
+        return self.h * (1 + 0.003 * np.cos(self.breath_phase * 0.9))
+
+    def try_grab(self, px, py, pdist, hand_angle, fingers):
+        if point_in_glass(px, py, self.cx, self.cy, self.w, self.h, self.angle):
+            self.grabbed = True
+            R = rot_mat(-self.angle)
+            v = np.array([px - self.cx, py - self.cy], dtype=np.float32)
+            self.grab_anchor_local = R @ v
+            self.grab_start_dist = max(pdist, 1.0)
+            self.grab_start_w = self.w
+            self.grab_start_h = self.h
+            self.grab_start_angle = self.angle
+            self.grab_start_hand_angle = hand_angle
+            self.fingers_used = fingers
+            return True
+        return False
+
+    def update(self, dt, frame_w, frame_h):
+        self.breath_phase += 0.03 * dt * 60
+        self.tilt_smooth += (self.tilt - self.tilt_smooth) * SMOOTH_TILT
+
+        target_glow = 1.0 if self.grabbed else 0.0
+        self.glow += (target_glow - self.glow) * 0.15
+
+        if self.grabbed:
+            self.cx += (self.target_cx - self.cx) * SMOOTH_POS
+            self.cy += (self.target_cy - self.cy) * SMOOTH_POS
+            self.w  += (self.target_w  - self.w)  * SMOOTH_SIZE
+            self.h  += (self.target_h  - self.h)  * SMOOTH_SIZE
+            d = ang_diff(self.target_angle, self.angle)
+            self.angle += d * SMOOTH_ANGLE
+
+            self.vx *= 0.5
+            self.vy *= 0.5
+            self.va *= 0.5
+        else:
+            self.cx += self.vx
+            self.cy += self.vy
+            self.angle += self.va
+
+            self.vx *= FRICTION
+            self.vy *= FRICTION
+            self.va *= ANG_FRICTION
+
+            if abs(self.vx) < 0.03: self.vx = 0.0
+            if abs(self.vy) < 0.03: self.vy = 0.0
+            if abs(self.va) < 0.02: self.va = 0.0
+
+            half_w = self.w / 2
+            half_h = self.h / 2
+            if self.cx - half_w < 0:
+                self.cx = half_w
+                self.vx = -self.vx * BOUNCE
+            if self.cx + half_w > frame_w:
+                self.cx = frame_w - half_w
+                self.vx = -self.vx * BOUNCE
+            if self.cy - half_h < 0:
+                self.cy = half_h
+                self.vy = -self.vy * BOUNCE
+            if self.cy + half_h > frame_h:
+                self.cy = frame_h - half_h
+                self.vy = -self.vy * BOUNCE
+
+            self.target_cx, self.target_cy = self.cx, self.cy
+            self.target_w, self.target_h = self.w, self.h
+            self.target_angle = self.angle
+
+        sp = np.hypot(self.vx, self.vy)
+        if sp > MAX_SPEED:
+            self.vx *= MAX_SPEED / sp
+            self.vy *= MAX_SPEED / sp
+        if abs(self.va) > MAX_ANG_SPEED:
+            self.va = np.sign(self.va) * MAX_ANG_SPEED
+
+    def set_target_pos(self, px, py):
+        R = rot_mat(self.angle)
+        world_anchor = R @ self.grab_anchor_local + np.array([self.cx, self.cy], dtype=np.float32)
+        dx = px - world_anchor[0]
+        dy = py - world_anchor[1]
+        self.target_cx = self.cx + dx
+        self.target_cy = self.cy + dy
+
+    def rotate_towards(self, target_angle):
+        self.target_angle = target_angle
+
+    def apply_flick(self, vx, vy, va=0.0, mult=1.0):
+        self.vx = np.clip(vx * mult, -MAX_SPEED, MAX_SPEED)
+        self.vy = np.clip(vy * mult, -MAX_SPEED, MAX_SPEED)
+        self.va = np.clip(va * mult, -MAX_ANG_SPEED, MAX_ANG_SPEED)
+
+glass = GlassItem(640, 360, GLASS_W, GLASS_H)
+
+def reset_glass():
+    global glass
+    glass = GlassItem(640, 360, GLASS_W, GLASS_H)
+
+def render_glass_roi(frame, g: GlassItem, show_shadow=True, show_glare=True):
+    fh, fw = frame.shape[:2]
+    bw = int(g.current_w())
+    bh = int(g.current_h())
+    cx, cy = int(g.cx), int(g.cy)
+    angle = g.angle
+
+    pad = 60
+    x1 = max(0, cx - bw // 2 - pad)
+    y1 = max(0, cy - bh // 2 - pad)
+    x2 = min(fw, cx + bw // 2 + pad)
+    y2 = min(fh, cy + bh // 2 + pad)
+
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return frame
+
+    roi = frame[y1:y2, x1:x2].copy()
+    rfh, rfw = roi.shape[:2]
+
+    lcx = cx - x1
+    lcy = cy - y1
+
+    if show_shadow:
+        shadow_layer = np.zeros_like(roi)
+        shadow_scale = 1.0 + 0.05 * (bw / GLASS_W)
+        sc = rounded_rect_poly(
+            lcx + SHADOW_OFFSET * shadow_scale,
+            lcy + SHADOW_OFFSET * shadow_scale,
+            bw * shadow_scale, bh * shadow_scale, angle, CORNER_RADIUS
+        ).astype(np.int32)
+        cv2.fillPoly(shadow_layer, [sc], (0, 0, 0))
+        shadow_layer = cv2.GaussianBlur(shadow_layer, (0, 0), SHADOW_BLUR)
+        roi = cv2.addWeighted(roi, 1.0, shadow_layer, SHADOW_ALPHA, 0)
+
+    yy, xx = np.mgrid[0:rfh, 0:rfw].astype(np.float32)
+    dx = xx - lcx
+    dy = yy - lcy
+    Rinv = rot_mat(-angle)
+    lx = Rinv[0, 0] * dx + Rinv[0, 1] * dy
+    ly = Rinv[1, 0] * dx + Rinv[1, 1] * dy
+
+    nx = lx / (bw / 2)
+    ny = ly / (bh / 2)
+    r2 = nx * nx + ny * ny
+    refract = 1.0 + REFRACT * r2
+    src_lx = lx / ZOOM * refract
+    src_ly = ly / ZOOM * refract
+
+    src_lx_r = src_lx * (1.0 + CHROMA)
+    src_ly_r = src_ly * (1.0 + CHROMA)
+    src_lx_b = src_lx * (1.0 - CHROMA)
+    src_ly_b = src_ly * (1.0 - CHROMA)
+
+    Rmat = rot_mat(angle)
+
+    def to_local(slx, sly):
+        wdx = Rmat[0, 0] * slx + Rmat[0, 1] * sly
+        wdy = Rmat[1, 0] * slx + Rmat[1, 1] * sly
+        return (lcx + wdx).astype(np.float32), (lcy + wdy).astype(np.float32)
+
+    map_x, map_y = to_local(src_lx, src_ly)
+    map_x_r, map_y_r = to_local(src_lx_r, src_ly_r)
+    map_x_b, map_y_b = to_local(src_lx_b, src_ly_b)
+
+    base = cv2.remap(roi, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    chan_r = cv2.remap(roi[:, :, 2], map_x_r, map_y_r, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    chan_b = cv2.remap(roi[:, :, 0], map_x_b, map_y_b, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    magnified = base.copy()
+    magnified[:, :, 2] = chan_r
+    magnified[:, :, 0] = chan_b
+
+    mask = np.zeros((rfh, rfw), dtype=np.uint8)
+    poly = rounded_rect_poly(lcx, lcy, bw, bh, angle, CORNER_RADIUS).astype(np.int32)
+    cv2.fillPoly(mask, [poly], 255)
+    mask_soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=2).astype(np.float32) / 255.0
+    mask3 = cv2.merge([mask_soft] * 3)
+
+    roi = (magnified * mask3 + roi * (1 - mask3)).astype(np.uint8)
+
+    tint = np.zeros_like(roi)
+    cv2.fillPoly(tint, [poly], TINT_BGR)
+    roi = cv2.addWeighted(roi, 1.0 - TINT_ALPHA, tint, TINT_ALPHA, 0)
+
+    if show_glare:
+        lx_norm = np.clip((lx + bw / 2) / bw, 0, 1)
+        ly_norm = np.clip((ly + bh / 2) / bh, 0, 1)
+        shift = 0.5 + 0.35 * np.tanh(g.tilt_smooth * 3.0)
+        diag = 1.0 - np.clip(np.abs((lx_norm * 0.7 + (1 - ly_norm) * 0.3) - shift) / 0.9, 0, 1)
+        glare = (diag ** 2) * mask_soft * GLARE_ALPHA
+        glare3 = cv2.merge([glare * 255] * 3)
+        roi = np.clip(roi.astype(np.float32) + glare3, 0, 255).astype(np.uint8)
+
+        spec = np.zeros((rfh, rfw), dtype=np.float32)
+        for k in range(1, 4):
+            band = np.exp(-((diag - (k * 0.18 + shift * 0.4)) ** 2) / 0.002)
+            spec += band * (0.6 / k)
+        spec = spec * mask_soft * SPECULAR_ALPHA
+        spec3 = cv2.merge([spec * 255] * 3)
+        roi = np.clip(roi.astype(np.float32) + spec3, 0, 255).astype(np.uint8)
+
+    glow = g.glow
+    edge_b = int(200 - 80 * glow)
+    edge_g = int(230 + 25 * glow)
+    edge_r = int(120 + 120 * glow)
+    edge_color = (edge_b, edge_g, edge_r)
+
+    if glow > 0.05:
+        glow_layer = np.zeros_like(roi)
+        glow_poly = rounded_rect_poly(lcx, lcy, bw + 14, bh + 14, angle, CORNER_RADIUS + 6).astype(np.int32)
+        cv2.polylines(glow_layer, [glow_poly], True, edge_color, 10, cv2.LINE_AA)
+        glow_layer = cv2.GaussianBlur(glow_layer, (0, 0), 12)
+        roi = cv2.addWeighted(roi, 1.0, glow_layer, 0.55 * glow, 0)
+
+    cv2.polylines(roi, [poly], True, edge_color, 3, cv2.LINE_AA)
+    inner_poly = rounded_rect_poly(
+        lcx, lcy, bw - BORDER, bh - BORDER, angle, max(CORNER_RADIUS - BORDER * 0.4, 4)
+    ).astype(np.int32)
+    cv2.polylines(roi, [inner_poly], True, (90, 100, 110), 1, cv2.LINE_AA)
+    outer_poly = rounded_rect_poly(
+        lcx, lcy, bw + 4, bh + 4, angle, CORNER_RADIUS + 2
+    ).astype(np.int32)
+    cv2.polylines(roi, [outer_poly], True, (255, 255, 255), 1, cv2.LINE_AA)
+
+    frame[y1:y2, x1:x2] = roi
+    return frame
+
+def draw_hud(frame, fingers, gesture, mode, fps, show_help):
+    fh, fw = frame.shape[:2]
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (fw, 46), (0, 0, 0), -1)
+    frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+
+    finger_color = (80, 255, 120) if fingers > 0 else (150, 150, 150)
+    cv2.putText(frame, f"FINGERS: {fingers}", (16, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, finger_color, 2, cv2.LINE_AA)
+
+    cv2.putText(frame, f"GESTURE: {gesture}", (230, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    mode_color = (80, 200, 255) if mode != "IDLE" else (180, 180, 180)
+    cv2.putText(frame, f"MODE: {mode}", (fw - 320, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2, cv2.LINE_AA)
+
+    cv2.putText(frame, f"FPS: {fps:4.1f}", (fw - 130, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 255, 200), 2, cv2.LINE_AA)
+
+    cv2.putText(frame, "ESC quit | F fullscreen | R reset | T shadow | G glare | H help | D debug",
+                (16, fh - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (220, 220, 220), 1, cv2.LINE_AA)
+
+    if show_help:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (fw - 380, 70), (fw - 12, 290), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
+        lines = [
+            "1 finger  - aim",
+            "2 fingers - grab & drag",
+            "3 fingers - tap (push)",
+            "4 fingers - drag fast",
+            "5 fingers - flick (throw)",
+            "fist      - hold still",
+            "2 hands   - scale + rotate",
+            "F fullscreen / H hide",
+        ]
+        for i, t in enumerate(lines):
+            cv2.putText(frame, t, (fw - 370, 95 + i * 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+
+    return frame
+
+fps_deque = deque(maxlen=30)
+prev_time = time.time()
+show_help = True
+
+gesture_history = deque(maxlen=GESTURE_HOLD)
+current_stable_gesture = "NONE"
+
+pos_history = deque(maxlen=5)
+smooth_pinch = None
+smooth_index = None
+smooth_hand_angle = None
+
+release_timer = 0
+last_fingers = 0
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    frame = cv2.flip(frame, 1)
+    fh, fw = frame.shape[:2]
+
+    now = time.time()
+    dt = max(now - prev_time, 1e-3)
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
+
+    hands_info = []
+    if results.multi_hand_landmarks:
+        for hand in results.multi_hand_landmarks:
+            if SHOW_DEBUG:
+                mp_draw.draw_landmarks(
+                    frame, hand, mp_hands.HAND_CONNECTIONS,
+                    mp_draw.DrawingSpec(color=(0, 255, 200), thickness=2, circle_radius=3),
+                    mp_draw.DrawingSpec(color=(0, 200, 255), thickness=1)
+                )
+
+            n_ext, ext_arr = count_extended_fingers(hand, fw, fh)
+
+            thumb = hand.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            index = hand.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            middle = hand.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+            wrist = hand.landmark[mp_hands.HandLandmark.WRIST]
+            mmcp = hand.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_MCP]
+
+            tx, ty = thumb.x * fw, thumb.y * fh
+            ix, iy = index.x * fw, index.y * fh
+            mx, my = middle.x * fw, middle.y * fh
+            wx, wy = wrist.x * fw, wrist.y * fh
+            mmx, mmy = mmcp.x * fw, mmcp.y * fh
+
+            pinch_x, pinch_y = (tx + ix) / 2, (ty + iy) / 2
+            pdist = float(np.hypot(tx - ix, ty - iy))
+            h_angle = float(np.degrees(np.arctan2(my - iy, mx - ix)))
+            palm = ((wx + mmx) / 2, (wy + mmy) / 2)
+            tilt = (palm[0] - ix) / fw
+
+            hands_info.append({
+                "pinch": (pinch_x, pinch_y, pdist),
+                "index": (ix, iy),
+                "palm": palm,
+                "angle": h_angle,
+                "tilt": tilt,
+                "fingers": n_ext,
+                "ext_arr": ext_arr,
+            })
+
+    if len(hands_info) >= 1:
+        h = hands_info[0]
+        pos_history.append(h["pinch"][:2])
+        if len(pos_history) >= 3:
+            arr = np.array(pos_history, dtype=np.float32)
+            med = np.median(arr, axis=0)
+            tx, ty = float(med[0]), float(med[1])
+        else:
+            tx, ty = h["pinch"][0], h["pinch"][1]
+        if smooth_pinch is None:
+            smooth_pinch = [tx, ty, h["pinch"][2]]
+            smooth_index = [h["index"][0], h["index"][1]]
+            smooth_hand_angle = h["angle"]
+        else:
+            smooth_pinch[0] += (tx - smooth_pinch[0]) * 0.4
+            smooth_pinch[1] += (ty - smooth_pinch[1]) * 0.4
+            smooth_pinch[2] += (h["pinch"][2] - smooth_pinch[2]) * 0.4
+            smooth_index[0] += (h["index"][0] - smooth_index[0]) * 0.4
+            smooth_index[1] += (h["index"][1] - smooth_index[1]) * 0.4
+            smooth_hand_angle += ang_diff(h["angle"], smooth_hand_angle) * 0.3
+    else:
+        smooth_pinch = None
+        smooth_index = None
+        smooth_hand_angle = None
+        pos_history.clear()
+
+    raw_gesture = "NONE"
+    if len(hands_info) == 1 and smooth_pinch is not None:
+        f = hands_info[0]["fingers"]
+        if f == 0: raw_gesture = "FIST"
+        elif f == 1: raw_gesture = "AIM"
+        elif f == 2: raw_gesture = "PINCH"
+        elif f == 3: raw_gesture = "TOUCH"
+        elif f == 4: raw_gesture = "DRAG"
+        elif f == 5: raw_gesture = "PALM"
+    elif len(hands_info) == 2:
+        raw_gesture = "TWO-HAND"
+
+    gesture_history.append(raw_gesture)
+    if len(gesture_history) == GESTURE_HOLD and len(set(gesture_history)) == 1:
+        current_stable_gesture = gesture_history[0]
+    if len(hands_info) == 0:
+        current_stable_gesture = "NONE"
+
+    mode = "IDLE"
+    fingers_hud = 0
+    gesture_hud = "—"
+
+    if len(hands_info) == 0:
+        if glass.grabbed:
+            if release_timer > 0:
+                release_timer -= 1
+            else:
+                glass.grabbed = False
+                glass.vx = glass.vy = 0.0
+
+    elif len(hands_info) == 2:
+        mode = "2-HAND"
+        h1, h2 = hands_info[0], hands_info[1]
+        fingers_hud = max(h1["fingers"], h2["fingers"])
+        p1 = np.array(h1["pinch"][:2], dtype=np.float32)
+        p2 = np.array(h2["pinch"][:2], dtype=np.float32)
+        d1 = h1["pinch"][2]
+        d2 = h2["pinch"][2]
+        both_pressed = d1 < PINCH_PRESS and d2 < PINCH_PRESS
+
+        if both_pressed:
+            mid = (p1 + p2) * 0.5
+            dist_pp = float(np.linalg.norm(p2 - p1))
+            ang_pp = float(np.degrees(np.arctan2((p2 - p1)[1], (p2 - p1)[0])))
+
+            if not glass.grabbed:
+                glass.grabbed = True
+                glass.grab_start_dist = max(dist_pp, 1.0)
+                glass.grab_start_w = glass.w
+                glass.grab_start_h = glass.h
+                glass.grab_start_angle = glass.angle - ang_pp
+                glass.grab_center_offset = np.array(
+                    [glass.cx - mid[0], glass.cy - mid[1]], dtype=np.float32
+                )
+                gesture_hud = "TWO-HAND GRAB"
+
+            release_timer = RELEASE_GRACE
+            glass.target_cx = mid[0] + glass.grab_center_offset[0]
+            glass.target_cy = mid[1] + glass.grab_center_offset[1]
+
+            scale = float(np.clip(dist_pp / glass.grab_start_dist, 0.4, 3.0))
+            glass.target_w = glass.grab_start_w * scale
+            glass.target_h = glass.grab_start_h * scale
+
+            glass.target_angle = glass.grab_start_angle + ang_pp
+
+            glass.tilt = (h1["tilt"] + h2["tilt"]) * 0.5
+            glass.fingers_used = fingers_hud
+            glass.gesture_name = gesture_hud
+        else:
+            if glass.grabbed:
+                if release_timer > 0:
+                    release_timer -= 1
+                else:
+                    glass.grabbed = False
+            gesture_hud = "PREPARE"
+
+    else:
+        h = hands_info[0]
+        fingers = h["fingers"]
+        fingers_hud = fingers
+        if smooth_pinch is not None:
+            px, py, pdist = smooth_pinch
+        else:
+            px, py, pdist = h["pinch"]
+        if smooth_index is not None:
+            ix, iy = smooth_index
+        else:
+            ix, iy = h["index"]
+        palm = h["palm"]
+        h_angle = smooth_hand_angle if smooth_hand_angle is not None else h["angle"]
+        mode = "1-HAND"
+
+        if fingers == 0:
+            gesture_hud = "FIST (stop)"
+        elif fingers == 1:
+            gesture_hud = "AIM"
+        elif fingers == 2:
+            gesture_hud = "PINCH (grab)"
+        elif fingers == 3:
+            gesture_hud = "TOUCH (tap)"
+        elif fingers == 4:
+            gesture_hud = "DRAG FAST"
+        elif fingers == 5:
+            gesture_hud = "PALM (flick)"
+        else:
+            gesture_hud = "?"
+
+        if fingers == 0 and glass.grabbed:
+            glass.vx = glass.vy = glass.va = 0.0
+            glass.target_cx, glass.target_cy = glass.cx, glass.cy
+            glass.fingers_used = 0
+            glass.gesture_name = gesture_hud
+
+        elif fingers == 1:
+            if glass.grabbed:
+                glass.set_target_pos(ix, iy)
+                glass.fingers_used = 1
+                glass.gesture_name = gesture_hud
+                glass.tilt = h["tilt"]
+
+        elif fingers == 2:
+            is_pressed = pdist < PINCH_PRESS
+            is_released = pdist > PINCH_RELEASE
+
+            if not glass.grabbed and is_pressed:
+                grabbed_ok = glass.try_grab(px, py, pdist, h_angle, fingers=2)
+                if grabbed_ok:
+                    glass.gesture_name = "GRABBED"
+
+            if glass.grabbed:
+                release_timer = RELEASE_GRACE
+                glass.set_target_pos(px, py)
+
+                scale = float(np.clip(pdist / glass.grab_start_dist, 0.5, 2.5))
+                glass.target_w = glass.grab_start_w * scale
+                glass.target_h = glass.grab_start_h * scale
+
+                d_angle = ang_diff(h_angle, glass.grab_start_hand_angle)
+                glass.rotate_towards(glass.grab_start_angle + d_angle)
+
+                glass.tilt = h["tilt"]
+                glass.fingers_used = 2
+                glass.gesture_name = gesture_hud
+
+            if glass.grabbed and is_released:
+                if release_timer > 0:
+                    release_timer -= 1
+                else:
+                    glass.grabbed = False
+                    glass.gesture_name = "RELEASED"
+
+        elif fingers == 3:
+            if not glass.grabbed and point_in_glass(px, py, glass.cx, glass.cy, glass.w, glass.h, glass.angle):
+                dx = glass.cx - px
+                dy = glass.cy - py
+                n = max(np.hypot(dx, dy), 1.0)
+                glass.apply_flick(dx / n * 14, dy / n * 14, va=np.random.uniform(-0.3, 0.3), mult=1.0)
+                glass.gesture_name = "TAP → push"
+
+        elif fingers == 4:
+            if not glass.grabbed:
+                glass.try_grab(px, py, pdist, h_angle, fingers=4)
+            if glass.grabbed:
+                release_timer = RELEASE_GRACE
+                glass.set_target_pos(palm[0], palm[1])
+                glass.fingers_used = 4
+                glass.gesture_name = gesture_hud
+
+        elif fingers == 5:
+            if point_in_glass(palm[0], palm[1], glass.cx, glass.cy,
+                              glass.w * 1.4, glass.h * 1.4, glass.angle):
+                dx = glass.cx - palm[0]
+                dy = glass.cy - palm[1]
+                n = max(np.hypot(dx, dy), 1.0)
+                glass.apply_flick(dx / n * 26, dy / n * 26,
+                                  va=np.random.uniform(-1.2, 1.2),
+                                  mult=FLICK_MULT)
+                glass.grabbed = False
+                glass.gesture_name = "FLICK!"
+
+    glass.update(dt, fw, fh)
+
+    frame = render_glass_roi(frame, glass, show_shadow=SHOW_SHADOW, show_glare=SHOW_GLARE)
+
+    if len(hands_info) == 1:
+        h = hands_info[0]
+        if smooth_index is not None:
+            ix, iy = smooth_index
+        else:
+            ix, iy = h["index"]
+        if smooth_pinch is not None:
+            px, py, pdist = smooth_pinch
+        else:
+            px, py, pdist = h["pinch"]
+        if h["fingers"] == 1:
+            cv2.circle(frame, (int(ix), int(iy)), 16, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(frame, (int(ix), int(iy)), 3, (0, 255, 255), -1, cv2.LINE_AA)
+        if h["fingers"] in (2, 4):
+            color = (80, 255, 120) if glass.grabbed else (255, 200, 80)
+            cv2.circle(frame, (int(px), int(py)), 10, color, 2, cv2.LINE_AA)
+        if h["fingers"] == 5:
+            cv2.circle(frame, (int(h["palm"][0]), int(h["palm"][1])), 24, (0, 140, 255), 2, cv2.LINE_AA)
+
+    if len(hands_info) >= 1:
+        total_f = sum(h["fingers"] for h in hands_info)
+        label = f"x{total_f}"
+        R = rot_mat(glass.angle)
+        top_local = np.array([0, -glass.h / 2 - 30], dtype=np.float32)
+        top = R @ top_local + np.array([glass.cx, glass.cy], dtype=np.float32)
+        cv2.putText(frame, label, (int(top[0]) - 18, int(top[1])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+
+    fps_deque.append(1.0 / dt)
+    fps = float(np.mean(fps_deque))
+
+    frame = draw_hud(frame, fingers_hud, gesture_hud,
+                     mode if glass.grabbed or len(hands_info) > 0 else "IDLE",
+                     fps, show_help)
+
+    cv2.imshow(WINDOW_NAME, frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:
+        break
+    elif key in (ord('f'), ord('F')):
+        FULLSCREEN = not FULLSCREEN
+        if FULLSCREEN:
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        else:
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+    elif key in (ord('r'), ord('R')):
+        reset_glass()
+    elif key in (ord('t'), ord('T')):
+        SHOW_SHADOW = not SHOW_SHADOW
+    elif key in (ord('g'), ord('G')):
+        SHOW_GLARE = not SHOW_GLARE
+    elif key in (ord('h'), ord('H')):
+        show_help = not show_help
+    elif key in (ord('d'), ord('D')):
+        SHOW_DEBUG = not SHOW_DEBUG
+
+    prev_time = now
+
+cap.release()
+cv2.destroyAllWindows()
